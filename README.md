@@ -33,6 +33,9 @@ around the low-level package. It provides functionality to open parquet files
 to read from them or write to them using automated or custom marshalling and
 unmarshalling.
 
+## Extra features in this fork
+- Embedded struct support during marshalling and unmarshalling from/to Parquet using the default reflectMarshaller
+
 ## Supported Features
 
 | Feature                                  | Read | Write | Note |

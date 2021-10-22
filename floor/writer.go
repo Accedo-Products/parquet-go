@@ -101,6 +101,16 @@ func (m *reflectMarshaller) decodeStruct(record interfaces.MarshalObject, value 
 	for i := 0; i < numFields; i++ {
 		fieldValue := value.Field(i)
 
+		fieldType := typ.Field(i)
+		if fieldType.Anonymous && fieldType.IsExported() {
+			// The struct is embedded and exported: pull all its fields up one level
+			err := m.decodeStruct(record, fieldValue, schemaDef)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+
 		fieldName := fieldNameFunc(typ.Field(i))
 
 		subSchemaDef := schemaDef.SubSchema(fieldName)

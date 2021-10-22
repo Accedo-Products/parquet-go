@@ -124,6 +124,19 @@ func (um *reflectUnmarshaller) fillStruct(value reflect.Value, record interfaces
 	for i := 0; i < numFields; i++ {
 		fieldValue := value.Field(i)
 
+		fieldType := typ.Field(i)
+		if fieldType.Anonymous && fieldType.IsExported() {
+			if value.Type().Kind() == reflect.Ptr {
+				value = value.Elem()
+			}
+			// The struct is embedded and exported: pull all its fields up one level
+			err := um.fillStruct(fieldValue, record, schemaDef)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+
 		fieldName := fieldNameFunc(typ.Field(i))
 
 		fieldSchemaDef := schemaDef.SubSchema(fieldName)
