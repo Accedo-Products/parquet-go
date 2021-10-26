@@ -264,13 +264,22 @@ func (c *Column) getData() (interface{}, int32, error) {
 }
 
 type schema struct {
-	schemaDef  *parquetschema.SchemaDefinition
+	schemaDef *parquetschema.SchemaDefinition
+
 	root       *Column
 	numRecords int64
 	readOnly   int
 
 	// selected columns in reading. if the size is zero, it means all the columns
 	selectedColumn []string
+}
+
+func (r *schema) normalizeDefinition() (err error) {
+	r.schemaDef, err = parquetschema.ParseSchemaDefinition(r.schemaDef.String())
+	if err != nil {
+		return errors.Wrap(err, "invalid schema")
+	}
+	return nil
 }
 
 func (r *schema) ensureRoot() {
@@ -291,6 +300,7 @@ func (r *schema) ensureRoot() {
 
 func (r *schema) SetSelectedColumns(selected ...string) {
 	r.selectedColumn = selected
+
 }
 
 func (r *schema) isSelected(path string) bool {
@@ -399,7 +409,7 @@ func (r *schema) SetSchemaDefinition(sd *parquetschema.SchemaDefinition) error {
 		recursiveFix(c, "", 0, 0)
 	}
 
-	return nil
+	return r.normalizeDefinition()
 }
 
 func createColumnFromColumnDefinition(root *parquetschema.ColumnDefinition) (*Column, error) {
@@ -915,7 +925,8 @@ func (r *schema) readSchema(schema []*parquet.SchemaElement) error {
 	}
 	r.sortIndex()
 	r.schemaDef = parquetschema.SchemaDefinitionFromColumnDefinition(createColumnDefinitionFromColumn(r.root))
-	return nil
+
+	return r.normalizeDefinition()
 }
 
 func createColumnDefinitionFromColumn(c *Column) *parquetschema.ColumnDefinition {
@@ -931,12 +942,7 @@ func createColumnDefinitionFromColumn(c *Column) *parquetschema.ColumnDefinition
 }
 
 func (r *schema) GetSchemaDefinition() *parquetschema.SchemaDefinition {
-	def, err := parquetschema.ParseSchemaDefinition(r.schemaDef.String())
-	if err != nil {
-		panic(err)
-	}
-
-	return def
+	return r.schemaDef
 }
 
 // DataSize return the size of data stored in the schema right now
