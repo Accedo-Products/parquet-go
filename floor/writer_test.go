@@ -11,7 +11,6 @@ import (
 	"github.com/fraugster/parquet-go/floor/interfaces"
 	"github.com/fraugster/parquet-go/parquet"
 	"github.com/fraugster/parquet-go/parquetschema"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -311,23 +310,78 @@ func TestDecodeStruct(t *testing.T) {
 			ExpectErr:      false,
 			Schema:         `message test { required int64 wakeywakey (TIME(NANOS, false)); }`,
 		},
+		{
+			Input: struct {
+				Foo   string
+				Times []interface{}
+			}{
+				Foo:   "bar",
+				Times: []interface{}{"2021-10-29T20:06:47.960577000Z", 1635542684, 1635542811912, 1635542811912010, 1635542854925031000},
+			},
+			ExpectedOutput: map[string]interface{}{
+				"foo": []byte("bar"),
+				"times": map[string]interface{}{
+					"list": []map[string]interface{}{
+						{"element": goparquet.TimeToInt96(time.Date(2021, 10, 29, 20, 06, 47, 960577000, time.UTC))},
+						{"element": goparquet.TimeToInt96(time.Date(2021, 10, 29, 21, 24, 44, 0, time.UTC))},
+						{"element": goparquet.TimeToInt96(time.Date(2021, 10, 29, 21, 26, 51, 912000000, time.UTC))},
+						{"element": goparquet.TimeToInt96(time.Date(2021, 10, 29, 21, 26, 51, 912010000, time.UTC))},
+						{"element": goparquet.TimeToInt96(time.Date(2021, 10, 29, 21, 27, 34, 925031000, time.UTC))},
+					},
+				},
+			},
+			ExpectErr: false,
+			Schema: `message test {
+				optional binary foo (STRING);
+				optional group times (LIST) {
+					repeated group list {
+						required int96 element;
+					}
+				}
+			}`,
+		},
+		{
+			Input:          map[string]interface{}{"foo": "bar"},
+			ExpectedOutput: map[string]interface{}{"foo": []byte("bar")},
+			ExpectErr:      false,
+			Schema:         `message test { optional binary foo (STRING); }`,
+		},
+		{
+			Input: map[string]interface{}{"foo": "bar", "data": map[string]interface{}{"foo": "bar"}},
+			ExpectedOutput: map[string]interface{}{
+				"foo": []byte("bar"),
+				"data": map[string]interface{}{
+					"key_value": []map[string]interface{}{
+						{"key": []byte("foo"), "value": []byte("bar")},
+					},
+				}},
+			ExpectErr: false,
+			Schema: `message test {
+				optional binary foo (STRING);
+				required group data (MAP) {
+					repeated group key_value {
+						required binary key (STRING);
+						optional binary value (STRING);
+					}
+				}
+			}`,
+		},
 	}
 
 	for idx, tt := range testData {
-		sd, err := parquetschema.ParseSchemaDefinition(tt.Schema)
-		assert.NoError(t, err, "%d. parsing schema failed", idx)
-		if err != nil {
-			continue
-		}
-		obj := interfaces.NewMarshallObject(nil)
-		m := &reflectMarshaller{obj: tt.Input, schemaDef: sd}
-		err = m.MarshalParquet(obj)
-		if tt.ExpectErr {
-			assert.Error(t, err, "%d. expected error, but found none", idx)
-		} else {
-			assert.NoError(t, err, "%d. expected no error, but found one", idx)
-			assert.Equal(t, tt.ExpectedOutput, obj.GetData(), "%d. output mismatch", idx)
-		}
+		t.Run(fmt.Sprintf("test_%d", idx), func(t *testing.T) {
+			sd, err := parquetschema.ParseSchemaDefinition(tt.Schema)
+			require.NoError(t, err, "%d. parsing schema failed", idx)
+			obj := interfaces.NewMarshallObject(nil)
+			m := &reflectMarshaller{obj: tt.Input, schemaDef: sd}
+			err = m.MarshalParquet(obj)
+			if tt.ExpectErr {
+				require.Error(t, err, "%d. expected error, but found none", idx)
+			} else {
+				require.NoError(t, err, "%d. expected no error, but found one", idx)
+				require.Equal(t, tt.ExpectedOutput, obj.GetData(), "%d. output mismatch; schema = %s", idx, tt.Schema)
+			}
+		})
 	}
 }
 
@@ -549,6 +603,49 @@ func TestWriteFileWithMarshallerThenReadWithUnmarshaller(t *testing.T) {
 	require.NoError(t, hlReader.Close())
 }
 
+func BenchmarkWriteFile(b *testing.B) {
+	_ = os.Mkdir("files", 0755)
+
+	sd, err := parquetschema.ParseSchemaDefinition(
+		`message test_msg {
+			required int64 foo;
+			optional binary bar (STRING);
+			optional group baz (LIST) {
+				repeated group list {
+					required int32 element;
+				}
+			}
+			optional int64 ts (TIMESTAMP(NANOS, false));
+			optional int64 time (TIME(NANOS, false));
+		}`)
+	require.NoError(b, err, "parsing schema definition failed")
+
+	hlWriter, err := NewFileWriter(
+		"files/test.parquet",
+		goparquet.WithCompressionCodec(parquet.CompressionCodec_SNAPPY),
+		goparquet.WithCreator("floor-unittest"),
+		goparquet.WithSchemaDefinition(sd),
+	)
+	require.NoError(b, err, "creating new file writer failed")
+	defer func() {
+		require.NoError(b, hlWriter.Close())
+	}()
+
+	data := struct {
+		Foo  int64
+		Bar  *string
+		Baz  []int32
+		Time *Time
+	}{
+		42, strPtr("world!"), []int32{1, 1, 2, 3, 5}, nil,
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = hlWriter.Write(data)
+	}
+}
+
 type marshTestRecord struct {
 	foo string
 	bar int64
@@ -568,13 +665,10 @@ func (r *marshTestRecord) MarshalParquet(obj interfaces.MarshalObject) error {
 		grp.AddField("quux").SetInt64(b.quux)
 	}
 
-	fmt.Printf("marshal data: %s", spew.Sdump(obj.GetData()))
 	return nil
 }
 
 func (r *marshTestRecord) UnmarshalParquet(obj interfaces.UnmarshalObject) error {
-	fmt.Printf("unmarshal data: %s", spew.Sdump(obj.GetData()))
-
 	foo := obj.GetField("foo")
 	if err := foo.Error(); err != nil {
 		return err
@@ -624,4 +718,106 @@ func (r *marshTestRecord) UnmarshalParquet(obj interfaces.UnmarshalObject) error
 	}
 
 	return nil
+}
+
+type testMsg struct {
+	ID     int64
+	Foobar []string
+}
+
+func (m *testMsg) MarshalParquet(obj interfaces.MarshalObject) error {
+	obj.AddField("id").SetInt64(m.ID)
+	list := obj.AddField("foobar").List()
+	for _, elem := range m.Foobar {
+		list.Add().SetByteArray([]byte(elem))
+	}
+	return nil
+}
+
+func (m *testMsg) UnmarshalParquet(obj interfaces.UnmarshalObject) error {
+	id, err := obj.GetField("id").Int64()
+	if err != nil {
+		return err
+	}
+	m.ID = id
+	list, err := obj.GetField("foobar").List()
+	if err == interfaces.ErrFieldNotPresent {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	for list.Next() {
+		v, err := list.Value()
+		if err != nil {
+			return err
+		}
+		vv, err := v.ByteArray()
+		if err != nil {
+			return err
+		}
+		m.Foobar = append(m.Foobar, string(vv))
+	}
+
+	return nil
+}
+
+func TestWriteEmptyList(t *testing.T) {
+	_ = os.Mkdir("files", 0755)
+
+	sd, err := parquetschema.ParseSchemaDefinition(
+		`message test_msg {
+			required int64 id;
+			optional group foobar (LIST) {
+				repeated group list {
+					required binary element (STRING);
+				}
+			}
+		}`)
+	require.NoError(t, err, "parsing schema definition failed")
+
+	t.Logf("schema definition: %s", spew.Sdump(sd))
+
+	hlWriter, err := NewFileWriter(
+		"files/emptylist.parquet",
+		goparquet.WithCompressionCodec(parquet.CompressionCodec_SNAPPY),
+		goparquet.WithCreator("floor-unittest"),
+		goparquet.WithSchemaDefinition(sd),
+	)
+	require.NoError(t, err, "creating new file writer failed")
+
+	testData1 := &testMsg{ID: 23, Foobar: nil}
+	require.NoError(t, hlWriter.Write(testData1), "writing object using marshaller failed")
+
+	testData2 := &testMsg{ID: 42, Foobar: []string{"so", "long", "and", "thanks", "for", "all", "the", "fish"}}
+	require.NoError(t, hlWriter.Write(testData2), "writing object using marshaller failed")
+
+	require.NoError(t, hlWriter.Write(testData1), "writing object using marshaller failed")
+	require.NoError(t, hlWriter.Write(testData2), "writing object using marshaller failed")
+
+	require.NoError(t, hlWriter.Close())
+
+	hlReader, err := NewFileReader("files/emptylist.parquet")
+	require.NoError(t, err, "opening file failed")
+
+	require.True(t, hlReader.Next())
+
+	readData1 := &testMsg{}
+	require.NoError(t, hlReader.Scan(readData1))
+	require.Equal(t, testData1, readData1, "written and read data don't match")
+
+	readData2 := &testMsg{}
+	require.NoError(t, hlReader.Scan(readData2))
+	require.Equal(t, testData1, readData2, "written and read data don't match")
+
+	readData3 := &testMsg{}
+	require.NoError(t, hlReader.Scan(readData3))
+	require.Equal(t, testData1, readData3, "written and read data don't match")
+
+	readData4 := &testMsg{}
+	require.NoError(t, hlReader.Scan(readData4))
+	require.Equal(t, testData1, readData4, "written and read data don't match")
+
+	require.NoError(t, hlReader.Close())
 }

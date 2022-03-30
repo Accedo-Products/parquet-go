@@ -87,8 +87,30 @@ func TestColumnSize(t *testing.T) {
 			err := sf.Col.add(arr[i], 0, 0, 0)
 			require.NoError(t, err)
 		}
-		require.Equal(t, size, sf.Col.values.size)
+		_, dataSize := sf.Col.values.sizes()
+		require.Equal(t, size, dataSize)
 	}
+}
+
+func TestIssue41SchemaPanic(t *testing.T) {
+	schema := `
+message ns.empRecords {
+  required int32 id;
+  required binary Name (STRING);
+  required binary Dept (STRING);
+  required group mapField (MAP) {
+    repeated group key_value (MAP_KEY_VALUE) {
+      required binary key (STRING);
+      required binary value (STRING);
+    }
+  }
+  required group loves (LIST) {
+    repeated binary array (STRING);
+  }
+}`
+
+	_, err := parquetschema.ParseSchemaDefinition(schema)
+	require.NoError(t, err)
 }
 
 func TestSchemaCopy(t *testing.T) {

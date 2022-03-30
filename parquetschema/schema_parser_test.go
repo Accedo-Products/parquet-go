@@ -38,7 +38,7 @@ func TestSchemaParser(t *testing.T) {
 			optional boolean is_fraud = 7;
 		}`, false, false},
 		// 10.
-		{`message $ { }`, true, false},                              // $ is not the start of a valid token.
+		{`message $ { }`, false, false},                             // unusual token
 		{`message foo { optional int128 bar; }`, true, false},       // invalid type
 		{`message foo { optional int64 bar (BLUB); }`, true, false}, // invalid logical type
 		{`message foo { optional int32 bar; }`, false, false},
@@ -295,7 +295,7 @@ func TestSchemaParser(t *testing.T) {
 		}`, true, false}, // precision out of bounds.
 		{`message foo {
 			required int64 foo (DECIMAL);
-		}`, true, false}, // no precision, scale parameters.
+		}`, false, false}, // no precision, scale parameters -> it's a converted type, so not an error; see also issue 12.
 		{`message foo {
 			required fixed_len_byte_array(10) foo (DECIMAL(20,10));
 		}`, false, false},

@@ -165,7 +165,8 @@ func (c *Column) getDataSize() int64 {
 		// Booleans are stored in one bit, so the result is the number of items / 8
 		return int64(c.data.values.numValues())/8 + 1
 	}
-	return c.data.values.size
+	_, dataSize := c.data.values.sizes()
+	return dataSize
 }
 
 func (c *Column) getNextData() (map[string]interface{}, int32, error) {
@@ -223,8 +224,8 @@ func (c *Column) getFirstRDLevel() (int32, int32, bool) {
 			return rl, dl, last
 		}
 
-		// if this value is not nil, dLevel less than this level is not interesting
-		if dl == int32(c.children[i].maxD) {
+		// if this value is not nil, rLevel or dLevel less than this level is not interesting
+		if rl >= int32(c.children[i].maxR) || dl >= int32(c.children[i].maxD) {
 			return rl, dl, last
 		}
 	}
@@ -269,6 +270,8 @@ type schema struct {
 	root       *Column
 	numRecords int64
 	readOnly   int
+
+	maxPageSize int64
 
 	// selected columns in reading. if the size is zero, it means all the columns
 	selectedColumn []string
@@ -398,7 +401,7 @@ func (r *schema) sortIndex() {
 func (r *schema) SetSchemaDefinition(sd *parquetschema.SchemaDefinition) error {
 	r.schemaDef = sd
 
-	root, err := createColumnFromColumnDefinition(r.schemaDef.RootColumn)
+	root, err := r.createColumnFromColumnDefinition(r.schemaDef.RootColumn)
 	if err != nil {
 		return err
 	}
@@ -412,7 +415,7 @@ func (r *schema) SetSchemaDefinition(sd *parquetschema.SchemaDefinition) error {
 	return r.normalizeDefinition()
 }
 
-func createColumnFromColumnDefinition(root *parquetschema.ColumnDefinition) (*Column, error) {
+func (r *schema) createColumnFromColumnDefinition(root *parquetschema.ColumnDefinition) (*Column, error) {
 	params := &ColumnParameters{
 		LogicalType:   root.SchemaElement.LogicalType,
 		ConvertedType: root.SchemaElement.ConvertedType,
@@ -430,14 +433,14 @@ func createColumnFromColumnDefinition(root *parquetschema.ColumnDefinition) (*Co
 
 	if len(root.Children) > 0 {
 		for _, c := range root.Children {
-			childColumn, err := createColumnFromColumnDefinition(c)
+			childColumn, err := r.createColumnFromColumnDefinition(c)
 			if err != nil {
 				return nil, err
 			}
 			col.children = append(col.children, childColumn)
 		}
 	} else {
-		dataColumn, err := getColumnStore(root.SchemaElement, params)
+		dataColumn, err := r.getColumnStore(root.SchemaElement, params)
 		if err != nil {
 			return nil, err
 		}
@@ -449,7 +452,7 @@ func createColumnFromColumnDefinition(root *parquetschema.ColumnDefinition) (*Co
 	return col, nil
 }
 
-func getColumnStore(elem *parquet.SchemaElement, params *ColumnParameters) (*ColumnStore, error) {
+func (r *schema) getColumnStore(elem *parquet.SchemaElement, params *ColumnParameters) (*ColumnStore, error) {
 	if elem.Type == nil {
 		return nil, nil
 	}
@@ -484,6 +487,8 @@ func getColumnStore(elem *parquet.SchemaElement, params *ColumnParameters) (*Col
 	if err != nil {
 		return nil, fmt.Errorf("creating Column store for type %q failed: %v", typ.String(), err)
 	}
+
+	colStore.maxPageSize = r.maxPageSize
 
 	return colStore, nil
 }
@@ -702,11 +707,17 @@ func (r *schema) findDataColumn(path string) (*Column, error) {
 func (r *schema) AddData(m map[string]interface{}) error {
 	r.readOnly = 1
 	r.ensureRoot()
-	err := recursiveAddColumnData(r.root.children, m, 0, 0, 0)
-	if err == nil {
-		r.numRecords++
+	err := r.recursiveAddColumnData(r.root.children, m, 0, 0, 0)
+	if err != nil {
+		return err
 	}
-	return err
+
+	if err := r.recursiveFlushPages(r.root.children); err != nil {
+		return err
+	}
+
+	r.numRecords++
+	return nil
 }
 
 func (r *schema) getData() (map[string]interface{}, error) {
@@ -721,7 +732,7 @@ func (r *schema) getData() (map[string]interface{}, error) {
 	return d.(map[string]interface{}), nil
 }
 
-func recursiveAddColumnNil(c []*Column, defLvl, maxRepLvl uint16, repLvl uint16) error {
+func (r *schema) recursiveAddColumnNil(c []*Column, defLvl, maxRepLvl uint16, repLvl uint16) error {
 	for i := range c {
 		if c[i].data != nil {
 			if c[i].rep == parquet.FieldRepetitionType_REQUIRED && defLvl == c[i].maxD {
@@ -732,7 +743,7 @@ func recursiveAddColumnNil(c []*Column, defLvl, maxRepLvl uint16, repLvl uint16)
 			}
 		}
 		if c[i].children != nil {
-			if err := recursiveAddColumnNil(c[i].children, defLvl, maxRepLvl, repLvl); err != nil {
+			if err := r.recursiveAddColumnNil(c[i].children, defLvl, maxRepLvl, repLvl); err != nil {
 				return err
 			}
 		}
@@ -740,7 +751,23 @@ func recursiveAddColumnNil(c []*Column, defLvl, maxRepLvl uint16, repLvl uint16)
 	return nil
 }
 
-func recursiveAddColumnData(c []*Column, m interface{}, defLvl uint16, maxRepLvl uint16, repLvl uint16) error {
+func (r *schema) recursiveFlushPages(c []*Column) error {
+	for i := range c {
+		if c[i].data != nil {
+			if err := c[i].data.flushPage(false); err != nil {
+				return err
+			}
+		}
+		if c[i].children != nil {
+			if err := r.recursiveFlushPages(c[i].children); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (r *schema) recursiveAddColumnData(c []*Column, m interface{}, defLvl uint16, maxRepLvl uint16, repLvl uint16) error {
 	var data = m.(map[string]interface{})
 	for i := range c {
 		d := data[c[i].name]
@@ -759,14 +786,14 @@ func recursiveAddColumnData(c []*Column, m interface{}, defLvl uint16, maxRepLvl
 
 			switch v := d.(type) {
 			case nil:
-				if err := recursiveAddColumnNil(c[i].children, l, maxRepLvl, repLvl); err != nil {
+				if err := r.recursiveAddColumnNil(c[i].children, l, maxRepLvl, repLvl); err != nil {
 					return err
 				}
 			case map[string]interface{}: // Not repeated
 				if c[i].rep == parquet.FieldRepetitionType_REPEATED {
 					return errors.Errorf("repeated group should be array")
 				}
-				if err := recursiveAddColumnData(c[i].children, v, l, maxRepLvl, repLvl); err != nil {
+				if err := r.recursiveAddColumnData(c[i].children, v, l, maxRepLvl, repLvl); err != nil {
 					return err
 				}
 			case []map[string]interface{}:
@@ -776,13 +803,13 @@ func recursiveAddColumnData(c []*Column, m interface{}, defLvl uint16, maxRepLvl
 				m := maxRepLvl + 1
 				rL := repLvl
 				if len(v) == 0 {
-					return recursiveAddColumnNil(c[i].children, l, m, rL)
+					return r.recursiveAddColumnNil(c[i].children, l, m, rL)
 				}
 				for vi := range v {
 					if vi > 0 {
 						rL = m
 					}
-					if err := recursiveAddColumnData(c[i].children, v[vi], l, m, rL); err != nil {
+					if err := r.recursiveAddColumnData(c[i].children, v[vi], l, m, rL); err != nil {
 						return err
 					}
 				}
@@ -988,8 +1015,8 @@ type SchemaReader interface {
 	isSelected(string) bool
 }
 
-// SchemaWriter is an interface with methods necessary in the FileWriter
-// to add groups and columns and to write data.
+// SchemaWriter was an interface with methods necessary in the FileWriter
+// to add groups and columns and to write data. Its use is deprecated.
 type SchemaWriter interface {
 	SchemaCommon
 

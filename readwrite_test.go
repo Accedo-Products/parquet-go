@@ -5,12 +5,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/fraugster/parquet-go/parquet"
 	"github.com/fraugster/parquet-go/parquetschema"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -18,7 +20,7 @@ import (
 func TestWriteThenReadFile(t *testing.T) {
 	ctx := context.Background()
 
-	testFunc := func(opts ...FileWriterOption) {
+	testFunc := func(t *testing.T, opts ...FileWriterOption) {
 		_ = os.Mkdir("files", 0755)
 
 		wf, err := os.OpenFile("files/test1.parquet", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
@@ -60,7 +62,7 @@ func TestWriteThenReadFile(t *testing.T) {
 		require.NoError(t, err, "creating file reader failed")
 
 		cols := r.Columns()
-		require.Len(t, cols, 2, fmt.Sprintf("expected 2 columns, got %d instead", len(cols)))
+		require.Len(t, cols, 2, "got %d column", len(cols))
 		require.Equal(t, "foo", cols[0].Name())
 		require.Equal(t, "foo", cols[0].FlatName())
 		require.Equal(t, "bar", cols[1].Name())
@@ -76,8 +78,12 @@ func TestWriteThenReadFile(t *testing.T) {
 		}
 	}
 
-	testFunc(WithCompressionCodec(parquet.CompressionCodec_SNAPPY), WithCreator("parquet-go-unittest"))
-	testFunc(WithCompressionCodec(parquet.CompressionCodec_SNAPPY), WithCreator("parquet-go-unittest"), WithDataPageV2())
+	t.Run("datapagev1", func(t *testing.T) {
+		testFunc(t, WithCompressionCodec(parquet.CompressionCodec_SNAPPY), WithCreator("parquet-go-unittest"))
+	})
+	t.Run("datapagev2", func(t *testing.T) {
+		testFunc(t, WithCompressionCodec(parquet.CompressionCodec_SNAPPY), WithCreator("parquet-go-unittest"), WithDataPageV2())
+	})
 }
 
 func TestWriteThenReadFileRepeated(t *testing.T) {
@@ -178,8 +184,8 @@ func TestWriteThenReadFileOptional(t *testing.T) {
 			assert.Equal(t, int32(1), dL)
 		} else {
 			assert.False(t, b)
-			assert.Equal(t, int32(-1), rL)
-			assert.Equal(t, int32(-1), dL)
+			assert.Equal(t, int32(0), rL)
+			assert.Equal(t, int32(0), dL)
 		}
 
 		get, err := r.getData()
@@ -876,4 +882,239 @@ func TestReadWriteColumeEncodings(t *testing.T) {
 
 func strPtr(s string) *string {
 	return &s
+}
+
+func TestWriteThenReadFileUnsetOptional(t *testing.T) {
+	sd, err := parquetschema.ParseSchemaDefinition(`
+		message foo {
+			optional group a (LIST) {
+				repeated group list {
+					optional group element {
+						optional int64 b;
+					}
+				}
+			}
+		}`)
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	require.NoError(t, err)
+	w := NewFileWriter(&buf, WithSchemaDefinition(sd))
+	testData := map[string]interface{}{
+		"a": map[string]interface{}{
+			"list": []map[string]interface{}{
+				{},
+				{
+					"element": map[string]interface{}{},
+				},
+				{
+					"element": map[string]interface{}{
+						"b": int64(2),
+					},
+				},
+			},
+		},
+	}
+	require.NoError(t, w.AddData(testData))
+	require.NoError(t, w.Close())
+
+	r, err := NewFileReader(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+
+	data, err := r.NextRow()
+	require.NoError(t, err)
+	require.Equal(t, testData, data)
+
+	_, err = r.NextRow()
+	require.Equal(t, io.EOF, err)
+}
+
+func TestReadWriteDeltaLengthByteArrayEncoding(t *testing.T) {
+	var buf bytes.Buffer
+
+	wr := NewFileWriter(&buf)
+
+	bas, err := NewByteArrayStore(parquet.Encoding_DELTA_LENGTH_BYTE_ARRAY, true, &ColumnParameters{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	col := NewDataColumn(bas, parquet.FieldRepetitionType_OPTIONAL)
+	if err := wr.AddColumn("name", col); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 1; i++ {
+		rec := map[string]interface{}{
+			"name": []byte("dan"),
+		}
+
+		if err := wr.AddData(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := wr.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rd, err := NewFileReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for {
+		row, err := rd.NextRow()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatal(err)
+		}
+		t.Log(row)
+	}
+}
+
+func TestReadWriteDeltaBinaryPackedInt32(t *testing.T) {
+	var buf bytes.Buffer
+
+	wr := NewFileWriter(&buf)
+
+	bas, err := NewInt32Store(parquet.Encoding_DELTA_BINARY_PACKED, true, &ColumnParameters{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	col := NewDataColumn(bas, parquet.FieldRepetitionType_OPTIONAL)
+	if err := wr.AddColumn("number", col); err != nil {
+		t.Fatal(err)
+	}
+
+	numRecords := 1
+
+	for i := 0; i < numRecords; i++ {
+		rec := map[string]interface{}{
+			"number": int32(42),
+		}
+
+		if err := wr.AddData(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := wr.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rd, err := NewFileReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("Reading data...")
+
+	for i := 0; i < numRecords; i++ {
+		row, err := rd.NextRow()
+		if err != nil {
+			t.Fatalf("got error at record %d of %d: %v", i+1, numRecords, err)
+		}
+		t.Log(row)
+	}
+
+	_, err = rd.NextRow()
+	require.True(t, errors.Is(err, io.EOF))
+
+	t.Logf("Finished")
+}
+
+func TestReadWriteDeltaBinaryPackedInt64(t *testing.T) {
+	var buf bytes.Buffer
+
+	wr := NewFileWriter(&buf)
+
+	bas, err := NewInt64Store(parquet.Encoding_DELTA_BINARY_PACKED, true, &ColumnParameters{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	col := NewDataColumn(bas, parquet.FieldRepetitionType_OPTIONAL)
+	if err := wr.AddColumn("number", col); err != nil {
+		t.Fatal(err)
+	}
+
+	numRecords := 1
+
+	for i := 0; i < numRecords; i++ {
+		rec := map[string]interface{}{
+			"number": int64(23),
+		}
+
+		if err := wr.AddData(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := wr.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rd, err := NewFileReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("Reading data...")
+
+	for i := 0; i < numRecords; i++ {
+		row, err := rd.NextRow()
+		if err != nil {
+			t.Fatalf("got error at record %d of %d: %v", i+1, numRecords, err)
+		}
+		t.Log(row)
+	}
+
+	_, err = rd.NextRow()
+	require.True(t, errors.Is(err, io.EOF))
+
+	t.Logf("Finished")
+}
+
+func TestWriteThenReadMultiplePages(t *testing.T) {
+	const mySchema = `message msg {
+		required binary ts_str (STRING);
+	}`
+
+	sd, err := parquetschema.ParseSchemaDefinition(mySchema)
+	require.NoError(t, err)
+
+	f := new(bytes.Buffer)
+
+	fw := NewFileWriter(f, WithSchemaDefinition(sd), WithCompressionCodec(parquet.CompressionCodec_SNAPPY))
+	defer fw.Close()
+
+	const numRows = 100000
+
+	records := []map[string]interface{}{}
+
+	for i := 0; i < numRows; i++ {
+		tsStr := time.Now().Add(time.Duration(1+rand.Int63n(300)) * time.Second).Format(time.RFC3339)
+		rec := map[string]interface{}{"ts_str": []byte(tsStr)}
+		records = append(records, rec)
+		require.NoError(t, fw.AddData(rec))
+	}
+
+	require.NoError(t, fw.Close())
+
+	r, err := NewFileReader(bytes.NewReader(f.Bytes()))
+	require.NoError(t, err)
+
+	rowCount := r.NumRows()
+	require.Equal(t, int64(numRows), rowCount)
+
+	for i := int64(0); i < rowCount; i++ {
+		data, err := r.NextRow()
+		require.NoError(t, err)
+		require.Equal(t, records[i], data, "%d. records don't match", i)
+		//fmt.Printf("in %d. %s\n", i, string(data["ts_str"].([]byte)))
+	}
 }
